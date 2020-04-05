@@ -8,7 +8,8 @@ In The 25th ACM SIGKDDConference on Knowledge Discovery and Data Mining (KDD ’
 August4–8, 2019, Anchorage, AK, USA.ACM, New York, NY, USA, 10 pages. https://doi.org/10.1145/3292500.3330871
 """
 
-from os.path import join
+from os.path import join, isdir, isfile
+import argparse
 
 import tensorflow as tf
 import numpy as np
@@ -34,8 +35,8 @@ MAX_INT = np.iinfo(np.int32).max
 class DevNet:
     """Deviation Network for credit card fraud detection."""
     def __init__(self, epochs, batch_size, num_runs, known_outliers, contamination_rate, seed,
-                 dataset_path='./dataset/creditcard.csv', output_dir='./output'):
-        self.output_dir = output_dir
+                 dataset_path='./dataset/creditcard.csv', output_path='./output'):
+        self.output_path = output_path
         self.dataset_path = dataset_path
 
         self.epochs = epochs
@@ -191,7 +192,7 @@ class DevNet:
             # create model
             model = self.deviation_network(input_shape)
             model_name = f'devnet_cr:{self.contamination_rate}_bs:{self.batch_size}_ko:{self.known_outliers}.h5'
-            checkpointer = ModelCheckpoint(join(self.output_dir, model_name), monitor='loss', verbose=0,
+            checkpointer = ModelCheckpoint(join(self.output_path, model_name), monitor='loss', verbose=0,
                                            save_best_only=True)
 
             generator = self.get_training_data_generator(x_train, outlier_indices, inlier_indices, rng)
@@ -212,6 +213,15 @@ class DevNet:
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset_path", type=str, default='dataset/', help="Path to the csv with creditcard dataset")
+    parser.add_argument("--output_dir", type=str, default='output/', help="Path to the output directory.")
+    args = parser.parse_args()
+
+    dataset_path = args.dataset_path if isfile(args.dataset_path) else None
+    output_path = args.output_dir if isdir(args.output_dir) else None
+
+
     is_gpu = tf.test.is_gpu_available()
     print(f"GPU is{'' if is_gpu else ' not'} available.")
 
@@ -223,5 +233,11 @@ if __name__ == '__main__':
         'contamination_rate': 0.02,
         'seed': SEED
     }
+    if dataset_path:
+        dev_net_conf['dataset_path'] = dataset_path
+
+    if output_path:
+        dev_net_conf['output_path'] = output_path
+
     dev_net = DevNet(**dev_net_conf)
     dev_net.run_devnet()
