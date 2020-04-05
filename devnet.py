@@ -218,7 +218,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     dataset_path = args.dataset_path if isfile(args.dataset_path) else None
-    output_path = args.output_dir if isdir(args.output_dir) else None
+    output_path = args.output_path if isdir(args.output_path) else None
 
     is_gpu = tf.test.is_gpu_available()
     print(f"GPU is{'' if is_gpu else ' not'} available.")
