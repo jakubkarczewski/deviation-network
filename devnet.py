@@ -13,74 +13,76 @@ from os.path import join
 import tensorflow as tf
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import average_precision_score, roc_auc_score
-from keras.callbacks import ModelCheckpoint
-from keras.optimizers import RMSprop
-from keras.layers import Input, Dense
-from keras.models import Model
-from keras import backend as K
-from keras import regularizers
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.optimizers import RMSprop
+from tensorflow.keras.layers import Input, Dense
+from tensorflow.keras.models import Model
+from tensorflow.keras.backend import mean, std, abs, maximum
+from tensorflow.keras.regularizers import l2
 
-# set seed values for reproducibility
-SEED = 1
+SEED = 7
 np.random.seed(SEED)
-tf.set_random_seed(SEED)
-sess = tf.Session()
+tf.random.set_seed(SEED)
 
 MAX_INT = np.iinfo(np.int32).max
 
 
 class DevNet:
     """Deviation Network for credit card fraud detection."""
-    def __init__(self, epochs, batch_size, num_batches, num_runs, known_outliers, contamination_rate, seed,
+    def __init__(self, epochs, batch_size, num_runs, known_outliers, contamination_rate, seed,
                  dataset_path='./dataset/creditcard.csv', output_dir='./output'):
         self.output_dir = output_dir
         self.dataset_path = dataset_path
 
         self.epochs = epochs
         self.batch_size = batch_size
-        self.num_batches = num_batches
+        self.num_batches = None
         self.num_runs = num_runs
         self.known_outliers = known_outliers
         self.contamination_rate = contamination_rate
         self.seed = seed
 
+        self.scaler = MinMaxScaler()
+
     @staticmethod
+    @tf.function
     def deviation_loss(y_true, y_pred):
         """Z-score based deviation loss"""
         confidence_margin = 5.
-        ref = K.variable(np.random.normal(loc=0., scale=1.0, size=5000), dtype='float32')
-        dev = (y_pred - K.mean(ref)) / K.std(ref)
-        inlier_loss = K.abs(dev)
-        outlier_loss = K.abs(K.maximum(confidence_margin - dev, 0.))
-        return K.mean((1 - y_true) * inlier_loss + y_true * outlier_loss)
+        ref = tf.cast(np.random.normal(loc=0., scale=1.0, size=5000), dtype=tf.float32)
+        dev = (y_pred - mean(ref)) / std(ref)
+        inlier_loss = abs(dev)
+        outlier_loss = abs(maximum(confidence_margin - dev, 0.))
+        return mean((1 - y_true) * inlier_loss + y_true * outlier_loss)
 
-    @classmethod
-    def deviation_network(cls, input_shape):
+    def deviation_network(self, input_shape, l2_coef=0.01):
         """Construct the deviation network-based detection model."""
         x_input = Input(shape=input_shape)
-        intermediate = Dense(20, activation='relu', kernel_regularizer=regularizers.l2(0.01), name='hl1')(x_input)
+        intermediate = Dense(20, activation='relu', kernel_regularizer=l2(l2_coef), name='hl1')(x_input)
         intermediate = Dense(1, activation='linear', name='score')(intermediate)
         model = Model(x_input, intermediate)
         rms = RMSprop(clipnorm=1.)
-        model.compile(loss=cls.deviation_loss, optimizer=rms)
+        model.compile(loss=self.deviation_loss, optimizer=rms)
         return model
 
-    def batch_generator_sup(self, x, outlier_indices, inlier_indices, rng):
-        """Generator """
+    def get_training_data_generator(self, x, outlier_indices, inlier_indices, rng):
+        """Generates batches of training data."""
         rng = np.random.RandomState(rng.randint(MAX_INT, size=1))
         counter = 0
         while True:
-            ref, training_labels = self.input_batch_generation_sup(x, outlier_indices, inlier_indices, rng)
+            ref, training_labels = self.get_one_training_batch(x, outlier_indices, inlier_indices, rng)
             counter += 1
-            yield ref, training_labels
+            yield ref.astype('float32'), training_labels.astype('float32')
 
             if counter > self.num_batches:
                 counter = 0
 
-    def input_batch_generation_sup(self, x_train, outlier_indices, inlier_indices, rng):
-        """Returns batches of samples. Alternates between positive and negative pairs."""
+    def get_one_training_batch(self, x_train, outlier_indices, inlier_indices, rng):
+        """Returns a single batch of training data. Alternates between positive and negative pairs."""
         dim = x_train.shape[1]
         ref = np.empty((self.batch_size, dim))
         training_labels = []
@@ -118,10 +120,20 @@ class DevNet:
 
     @staticmethod
     def auc_performance(mse, labels):
+        """Returns performance metrics."""
         roc_auc = roc_auc_score(labels, mse)
         avg_precision = average_precision_score(labels, mse)
         print(f"AUC-ROC: {roc_auc}, AUC-PR: {avg_precision}")
         return roc_auc, avg_precision
+
+    @staticmethod
+    def plot_loss(history):
+        # Plot loss values
+        plt.plot(history.history['loss'])
+        plt.title('Model loss')
+        plt.ylabel('Loss')
+        plt.xlabel('Epoch')
+        plt.show()
 
     def run_devnet(self):
         # create placeholder variables for scores in each run
@@ -129,8 +141,15 @@ class DevNet:
         ap = np.zeros(self.num_runs)
         # read data
         dataset = pd.read_csv(self.dataset_path)
-        y = dataset['Class'].values
-        x = dataset.drop(columns=['Class']).values
+        # scale data
+        scaled_data = self.scaler.fit_transform(dataset)
+        scaled_dataset = pd.DataFrame(scaled_data, columns=dataset.columns, index=dataset.index)
+        y = scaled_dataset['Class'].values
+        x = scaled_dataset.drop(columns=['Class']).values
+        print(f'X size {x.shape}')
+        print(f'Number of batches per epoch: {len(x) // self.batch_size}')
+        # self.num_batches = len(x) // self.batch_size
+        self.num_batches = 20
         # inspect number of frauds (outliers)
         outlier_indices = np.where(y == 1)[0]
         outliers = x[outlier_indices]
@@ -144,12 +163,12 @@ class DevNet:
             outlier_indices = np.where(y_train == 1)[0]
             n_outliers = len(outlier_indices)
             print(f"Original training size for run {run_id}: {x_train.shape[0]}, No. outliers: {n_outliers}")
-            # todo: figure out what is going on here - removal of excess outliers?
 
             # add noise to data
             n_noise = len(np.where(y_train == 0)[0]) * self.contamination_rate / (1. - self.contamination_rate)
             n_noise = int(n_noise)
 
+            # todo: figure out what is going on here - removal of excess outliers?
             rng = np.random.RandomState(self.seed)
             if n_outliers > self.known_outliers:
                 mn = n_outliers - self.known_outliers
@@ -171,17 +190,19 @@ class DevNet:
 
             # create model
             model = self.deviation_network(input_shape)
-            print(model.summary())
             model_name = f'devnet_cr:{self.contamination_rate}_bs:{self.batch_size}_ko:{self.known_outliers}.h5'
             checkpointer = ModelCheckpoint(join(self.output_dir, model_name), monitor='loss', verbose=0,
                                            save_best_only=True)
 
-            generator = self.batch_generator_sup(x_train, outlier_indices, inlier_indices, rng)
-            model.fit_generator(generator, steps_per_epoch=self.num_batches, epochs=self.epochs,
+            generator = self.get_training_data_generator(x_train, outlier_indices, inlier_indices, rng)
+            history = model.fit(generator, steps_per_epoch=self.num_batches, epochs=self.epochs,
                                 callbacks=[checkpointer])
 
             scores = model.predict(x_test)
             rauc[run_id], ap[run_id] = self.auc_performance(scores, y_test)
+
+        # show training history
+        self.plot_loss(history)
 
         mean_auc = np.mean(rauc)
         std_auc = np.std(rauc)
@@ -191,9 +212,11 @@ class DevNet:
 
 
 if __name__ == '__main__':
+    is_gpu = tf.test.is_gpu_available()
+    print(f"GPU is{'' if is_gpu else ' not'} available.")
+
     dev_net_conf = {
         'batch_size': 512,
-        'num_batches': 20,  # todo: check, I would rather get rid of it
         'epochs': 250,
         'num_runs': 5,
         'known_outliers': 30,
