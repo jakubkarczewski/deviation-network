@@ -149,8 +149,7 @@ class DevNet:
         x = scaled_dataset.drop(columns=['Class']).values
         print(f'X size {x.shape}')
         print(f'Number of batches per epoch: {len(x) // self.batch_size}')
-        # self.num_batches = len(x) // self.batch_size
-        self.num_batches = 20
+        self.num_batches = len(x) // self.batch_size
         # inspect number of frauds (outliers)
         outlier_indices = np.where(y == 1)[0]
         outliers = x[outlier_indices]
@@ -215,12 +214,11 @@ class DevNet:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_path", type=str, default='dataset/', help="Path to the csv with creditcard dataset")
-    parser.add_argument("--output_dir", type=str, default='output/', help="Path to the output directory.")
+    parser.add_argument("--output_path", type=str, default='output/', help="Path to the output directory.")
     args = parser.parse_args()
 
     dataset_path = args.dataset_path if isfile(args.dataset_path) else None
     output_path = args.output_dir if isdir(args.output_dir) else None
-
 
     is_gpu = tf.test.is_gpu_available()
     print(f"GPU is{'' if is_gpu else ' not'} available.")
@@ -229,7 +227,7 @@ if __name__ == '__main__':
         'batch_size': 512,
         'epochs': 250,
         'num_runs': 5,
-        'known_outliers': 30,
+        'known_outliers': 500,
         'contamination_rate': 0.02,
         'seed': SEED
     }
