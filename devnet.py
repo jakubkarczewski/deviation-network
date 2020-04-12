@@ -166,6 +166,8 @@ class DevNet:
             if self.limit_of_anomalies:
                 x_train, y_train = self._limit_num_anomalies(num_train_anomalies, x_train, y_train)
 
+            # todo: figure this out, without injecting the noise the net doesn't train, can be a bug idk
+            assert self.noise_ratio is not None, "Sorry, it won't train without it."
             if self.noise_ratio:
                 # add noise to data
                 n_noise = int(len(np.where(y_train == 0)[0]) * self.contamination_rate / (1. - self.contamination_rate))
@@ -222,6 +224,7 @@ if __name__ == '__main__':
         'batch_size': 512,
         'epochs': 250,
         'num_runs': 5,
+        'noise_ratio': 0.05,
         'seed': SEED
     }
     if dataset_path:
