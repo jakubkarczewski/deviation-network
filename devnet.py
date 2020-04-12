@@ -43,6 +43,7 @@ class DevNet:
         self.epochs = epochs
         self.batch_size = batch_size
         self.num_runs = num_runs
+        self.num_batches = None
 
         self.limit_of_anomalies = limit_of_anomalies
         self.contamination_rate = contamination_rate
@@ -73,9 +74,17 @@ class DevNet:
         model.compile(loss=self.deviation_loss, optimizer=rms)
         return model
 
-    def get_pairs(self, x_train, anomaly_indexes, normal_indexes):
+    def get_data_generator(self, x, y):
+        """Generates batches of training data."""
+        anomaly_indexes = np.where(y == 1)[0]
+        normal_indexes = np.where(y == 0)[0]
+        while True:
+            ref, training_labels = self.get_batch(x, anomaly_indexes, normal_indexes)
+            yield ref.astype('float32'), training_labels.astype('float32')
+
+    def get_batch(self, x_train, anomaly_indexes, normal_indexes):
         """Preprocess training set by alternating between negative and positive pairs."""
-        preprocessed_x_train = np.empty(x_train.shape)
+        preprocessed_x_train = np.empty((self.batch_size, x_train.shape[-1]))
         training_labels = []
         n_normal = len(normal_indexes)
         n_anomaly = len(anomaly_indexes)
@@ -88,7 +97,7 @@ class DevNet:
                 selected_idx = self.random_state.choice(n_anomaly, 1)
                 preprocessed_x_train[i] = x_train[anomaly_indexes[selected_idx]]
                 training_labels += [1]
-        return np.array(preprocessed_x_train).astype('float32'), np.array(training_labels).astype('float32')
+        return np.array(preprocessed_x_train), np.array(training_labels)
 
     def _inject_noise(self, anomalies, num_noise_samples, x_train, y_train):
         """
@@ -151,6 +160,8 @@ class DevNet:
         y = scaled_dataset['Class'].values
         x = scaled_dataset.drop(columns=['Class']).values
         print(f'X shape {x.shape}')
+        self.num_batches = len(x) // self.batch_size
+        print(f'Number of batches per epoch: {self.num_batches}')
         # inspect number of frauds (anomalies)
         anomalies = x[np.where(y == 1)[0]]
         print(f'There are {len(anomalies)} original frauds (outliers) in the dataset.')
@@ -166,20 +177,14 @@ class DevNet:
             if self.limit_of_anomalies:
                 x_train, y_train = self._limit_num_anomalies(num_train_anomalies, x_train, y_train)
 
-            # todo: figure this out, without injecting the noise the net doesn't train, can be a bug idk
-            assert self.noise_ratio is not None, "Sorry, it won't train without it."
             if self.noise_ratio:
                 # add noise to data
                 n_noise = int(len(np.where(y_train == 0)[0]) * self.contamination_rate / (1. - self.contamination_rate))
                 train_anomalies = x_train[np.where(y_train == 1)[0]]
                 x_train, y_train = self._inject_noise(train_anomalies, n_noise, x_train, y_train)
 
-            # new outlier indices
-            outlier_indices = np.where(y_train == 1)[0]
-            inlier_indices = np.where(y_train == 0)[0]
-            n_outliers = len(outlier_indices)
             print(f"Post-transformations training size for run {run_id}: {x_train.shape[0]},"
-                  f" No. outliers: {n_outliers}")
+                  f" No. outliers: {len(np.where(y_train == 1)[0])}")
 
             input_shape = x_train.shape[1:]
 
@@ -188,11 +193,12 @@ class DevNet:
             model_name = f'devnet_cr:{self.contamination_rate}_bs:{self.batch_size}_ko:{self.limit_of_anomalies}.h5'
             checkpointer = ModelCheckpoint(join(self.output_path, model_name), monitor='loss', verbose=0,
                                            save_best_only=True)
-            x_train, y_train = self.get_pairs(x, outlier_indices, inlier_indices)
-
             x_train, x_val, y_train, y_val = train_test_split(x_train, y_train, test_size=0.2, random_state=self.seed,
                                                               stratify=y_train)
-            history = model.fit(x_train, y_train, validation_data=(x_val, y_val),  epochs=self.epochs,
+            train_generator = self.get_data_generator(x_train, y_train)
+            val_generator = self.get_data_generator(x_val, y_val)
+            history = model.fit(train_generator, validation_data=val_generator,  epochs=self.epochs,
+                                steps_per_epoch=self.num_batches, validation_steps=len(x_val)//self.batch_size,
                                 callbacks=[checkpointer])
 
             preds = model.predict(x_test)
@@ -224,7 +230,6 @@ if __name__ == '__main__':
         'batch_size': 512,
         'epochs': 250,
         'num_runs': 5,
-        'noise_ratio': 0.05,
         'seed': SEED
     }
     if dataset_path:
