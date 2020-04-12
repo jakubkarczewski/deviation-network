@@ -7,16 +7,17 @@ Deep Anomaly Detection with Deviation Networks.
 In The 25th ACM SIGKDDConference on Knowledge Discovery and Data Mining (KDD ’19),
 August4–8, 2019, Anchorage, AK, USA.ACM, New York, NY, USA, 10 pages. https://doi.org/10.1145/3292500.3330871
 """
-
+import pickle
 from os.path import join, isdir, isfile
 import argparse
+from copy import deepcopy
 
 import tensorflow as tf
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import average_precision_score, roc_auc_score, precision_recall_curve, auc
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.callbacks import ModelCheckpoint
 from tensorflow.keras.optimizers import RMSprop
@@ -34,20 +35,22 @@ MAX_INT = np.iinfo(np.int32).max
 
 class DevNet:
     """Deviation Network for credit card fraud detection."""
-    def __init__(self, epochs, batch_size, num_runs, known_outliers, contamination_rate, seed,
-                 dataset_path='./dataset/creditcard.csv', output_path='./output'):
+    def __init__(self, epochs, batch_size, num_runs, seed, dataset_path='./dataset/creditcard.csv',
+                 output_path='./output', contamination_rate=0.02, limit_of_anomalies=None, noise_ratio=None):
         self.output_path = output_path
         self.dataset_path = dataset_path
 
         self.epochs = epochs
         self.batch_size = batch_size
-        self.num_batches = None
         self.num_runs = num_runs
-        self.known_outliers = known_outliers
+
+        self.limit_of_anomalies = limit_of_anomalies
         self.contamination_rate = contamination_rate
+        self.noise_ratio = noise_ratio
         self.seed = seed
 
         self.scaler = MinMaxScaler()
+        self.random_state = np.random.RandomState(self.seed)
 
     @staticmethod
     @tf.function
@@ -56,9 +59,9 @@ class DevNet:
         confidence_margin = 5.
         ref = tf.cast(np.random.normal(loc=0., scale=1.0, size=5000), dtype=tf.float32)
         dev = (y_pred - mean(ref)) / std(ref)
-        inlier_loss = abs(dev)
-        outlier_loss = abs(maximum(confidence_margin - dev, 0.))
-        return mean((1 - y_true) * inlier_loss + y_true * outlier_loss)
+        normal_loss = abs(dev)
+        anomaly_loss = abs(maximum(confidence_margin - dev, 0.))
+        return mean((1 - y_true) * normal_loss + y_true * anomaly_loss)
 
     def deviation_network(self, input_shape, l2_coef=0.01):
         """Construct the deviation network-based detection model."""
@@ -70,76 +73,76 @@ class DevNet:
         model.compile(loss=self.deviation_loss, optimizer=rms)
         return model
 
-    def get_training_data_generator(self, x, outlier_indices, inlier_indices, rng):
-        """Generates batches of training data."""
-        rng = np.random.RandomState(rng.randint(MAX_INT, size=1))
-        counter = 0
-        while True:
-            ref, training_labels = self.get_one_training_batch(x, outlier_indices, inlier_indices, rng)
-            counter += 1
-            yield ref.astype('float32'), training_labels.astype('float32')
-
-            if counter > self.num_batches:
-                counter = 0
-
-    def get_one_training_batch(self, x_train, outlier_indices, inlier_indices, rng):
-        """Returns a single batch of training data. Alternates between positive and negative pairs."""
-        dim = x_train.shape[1]
-        ref = np.empty((self.batch_size, dim))
+    def get_pairs(self, x_train, anomaly_indexes, normal_indexes):
+        """Preprocess training set by alternating between negative and positive pairs."""
+        preprocessed_x_train = np.empty(x_train.shape)
         training_labels = []
-        n_inliers = len(inlier_indices)
-        n_outliers = len(outlier_indices)
-        for i in range(self.batch_size):
+        n_normal = len(normal_indexes)
+        n_anomaly = len(anomaly_indexes)
+        for i in range(len(preprocessed_x_train)):
             if i % 2 == 0:
-                sid = rng.choice(n_inliers, 1)
-                ref[i] = x_train[inlier_indices[sid]]
+                selected_idx = self.random_state.choice(n_normal, 1)
+                preprocessed_x_train[i] = x_train[normal_indexes[selected_idx]]
                 training_labels += [0]
             else:
-                sid = rng.choice(n_outliers, 1)
-                ref[i] = x_train[outlier_indices[sid]]
+                selected_idx = self.random_state.choice(n_anomaly, 1)
+                preprocessed_x_train[i] = x_train[anomaly_indexes[selected_idx]]
                 training_labels += [1]
-        return np.array(ref), np.array(training_labels)
+        return np.array(preprocessed_x_train).astype('float32'), np.array(training_labels).astype('float32')
 
-    def inject_noise(self, seed, n_out):
+    def _inject_noise(self, anomalies, num_noise_samples, x_train, y_train):
         """
         Add anomalies to training data to replicate anomaly contaminated data sets.
         We randomly swap 5% features of anomalies to avoid duplicate contaminated anomalies.
         """
-        rng = np.random.RandomState(self.seed)
-        n_sample, dim = seed.shape
-        swap_ratio = 0.05
-        n_swap_feat = int(swap_ratio * dim)
-        noise = np.empty((n_out, dim))
-        for i in np.arange(n_out):
-            outlier_idx = rng.choice(n_sample, 2, replace=False)
-            o1 = seed[outlier_idx[0]]
-            o2 = seed[outlier_idx[1]]
-            swap_feats = rng.choice(dim, n_swap_feat, replace=False)
-            noise[i] = o1.copy()
-            noise[i, swap_feats] = o2[swap_feats]
-        return noise
+        n_sample, feat_num = anomalies.shape
+        n_swap_feat = int(self.noise_ratio * feat_num)
+        noise = np.empty((num_noise_samples, feat_num))
+        for i in np.arange(num_noise_samples):
+            anomaly_idx = self.random_state.choice(n_sample, 2, replace=False)
+            anomaly_1 = anomalies[anomaly_idx[0]]
+            anomaly_2 = anomalies[anomaly_idx[1]]
+            swap_feats = self.random_state.choice(feat_num, n_swap_feat, replace=False)
+            noise[i] = anomaly_1.copy()
+            noise[i, swap_feats] = anomaly_2[swap_feats]
+
+        x_train = np.append(x_train, noise, axis=0)
+        y_train = np.append(y_train, np.zeros((noise.shape[0], 1)))
+        return x_train, y_train
 
     @staticmethod
-    def auc_performance(mse, labels):
+    def get_metrics(gt, preds):
         """Returns performance metrics."""
-        roc_auc = roc_auc_score(labels, mse)
-        avg_precision = average_precision_score(labels, mse)
-        print(f"AUC-ROC: {roc_auc}, AUC-PR: {avg_precision}")
-        return roc_auc, avg_precision
+        roc_auc = roc_auc_score(gt, preds)
+        precision, recall, _ = precision_recall_curve(gt, preds)
+        pr_auc = auc(recall, precision)
+        avg_precision = average_precision_score(gt, preds)
+        print(f"AUC-ROC: {roc_auc}, AUC-PR: {pr_auc}, Avg precision: {avg_precision}")
+        return {'AUC-ROC': roc_auc, 'AUC-PR': pr_auc, 'Avg Precision': avg_precision}
 
     @staticmethod
     def plot_loss(history):
-        # Plot loss values
-        plt.plot(history.history['loss'])
+        # Plot training & validation loss values
+        plt.plot(history['loss'])
+        plt.plot(history['val_loss'])
         plt.title('Model loss')
         plt.ylabel('Loss')
         plt.xlabel('Epoch')
+        plt.legend(['Train', 'Test'], loc='upper left')
         plt.show()
+
+    def _limit_num_anomalies(self, num_anomalies, x_train, y_train):
+        """Limit anomalies to certain number."""
+        if num_anomalies > self.limit_of_anomalies:
+            excess_anomalies = num_anomalies - self.limit_of_anomalies
+            remove_idx = self.random_state.choice(num_anomalies, excess_anomalies, replace=False)
+            x_train = np.delete(x_train, remove_idx, axis=0)
+            y_train = np.delete(y_train, remove_idx, axis=0)
+        return x_train, y_train
 
     def run_devnet(self):
         # create placeholder variables for scores in each run
-        rauc = np.zeros(self.num_runs)
-        ap = np.zeros(self.num_runs)
+        metrics = {name: np.zeros(self.num_runs) for name in ('AUC-ROC', 'AUC-PR', 'Avg Precision')}
         # read data
         dataset = pd.read_csv(self.dataset_path)
         # scale data
@@ -147,68 +150,60 @@ class DevNet:
         scaled_dataset = pd.DataFrame(scaled_data, columns=dataset.columns, index=dataset.index)
         y = scaled_dataset['Class'].values
         x = scaled_dataset.drop(columns=['Class']).values
-        print(f'X size {x.shape}')
-        print(f'Number of batches per epoch: {len(x) // self.batch_size}')
-        self.num_batches = len(x) // self.batch_size
-        # inspect number of frauds (outliers)
-        outlier_indices = np.where(y == 1)[0]
-        outliers = x[outlier_indices]
-        # log original outlier number
-        print(f'There are {len(outliers)} original frauds (outliers) in the dataset.')
+        print(f'X shape {x.shape}')
+        # inspect number of frauds (anomalies)
+        anomalies = x[np.where(y == 1)[0]]
+        print(f'There are {len(anomalies)} original frauds (outliers) in the dataset.')
         # run training several times
         for run_id in np.arange(self.num_runs):
             # split data into train/test
             x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=self.seed, stratify=y)
             print(f'Run number: {run_id}')
-            outlier_indices = np.where(y_train == 1)[0]
-            n_outliers = len(outlier_indices)
-            print(f"Original training size for run {run_id}: {x_train.shape[0]}, No. outliers: {n_outliers}")
+            original_train_anomaly_indices = np.where(y_train == 1)[0]
+            num_train_anomalies = len(original_train_anomaly_indices)
+            print(f"Original training size for run {run_id}: {x_train.shape[0]}, No. outliers: {num_train_anomalies}")
 
-            # add noise to data
-            n_noise = len(np.where(y_train == 0)[0]) * self.contamination_rate / (1. - self.contamination_rate)
-            n_noise = int(n_noise)
+            if self.limit_of_anomalies:
+                x_train, y_train = self._limit_num_anomalies(num_train_anomalies, x_train, y_train)
 
-            # todo: figure out what is going on here - removal of excess outliers?
-            rng = np.random.RandomState(self.seed)
-            if n_outliers > self.known_outliers:
-                mn = n_outliers - self.known_outliers
-                remove_idx = rng.choice(outlier_indices, mn, replace=False)
-                x_train = np.delete(x_train, remove_idx, axis=0)
-                y_train = np.delete(y_train, remove_idx, axis=0)
-
-            noises = self.inject_noise(outliers, n_noise)
-            x_train = np.append(x_train, noises, axis=0)
-            y_train = np.append(y_train, np.zeros((noises.shape[0], 1)))
+            if self.noise_ratio:
+                # add noise to data
+                n_noise = int(len(np.where(y_train == 0)[0]) * self.contamination_rate / (1. - self.contamination_rate))
+                train_anomalies = x_train[np.where(y_train == 1)[0]]
+                x_train, y_train = self._inject_noise(train_anomalies, n_noise, x_train, y_train)
 
             # new outlier indices
             outlier_indices = np.where(y_train == 1)[0]
             inlier_indices = np.where(y_train == 0)[0]
             n_outliers = len(outlier_indices)
-            print(f"Post-transformations training size for run {run_id}: {x_train.shape[0]}, No. outliers: {n_outliers}")
+            print(f"Post-transformations training size for run {run_id}: {x_train.shape[0]},"
+                  f" No. outliers: {n_outliers}")
 
             input_shape = x_train.shape[1:]
 
             # create model
             model = self.deviation_network(input_shape)
-            model_name = f'devnet_cr:{self.contamination_rate}_bs:{self.batch_size}_ko:{self.known_outliers}.h5'
+            model_name = f'devnet_cr:{self.contamination_rate}_bs:{self.batch_size}_ko:{self.limit_of_anomalies}.h5'
             checkpointer = ModelCheckpoint(join(self.output_path, model_name), monitor='loss', verbose=0,
                                            save_best_only=True)
+            x_train, y_train = self.get_pairs(x, outlier_indices, inlier_indices)
 
-            generator = self.get_training_data_generator(x_train, outlier_indices, inlier_indices, rng)
-            history = model.fit(generator, steps_per_epoch=self.num_batches, epochs=self.epochs,
+            x_train, x_val, y_train, y_val = train_test_split(x_train, y_train, test_size=0.2, random_state=self.seed,
+                                                              stratify=y_train)
+            history = model.fit(x_train, y_train, validation_data=(x_val, y_val),  epochs=self.epochs,
                                 callbacks=[checkpointer])
 
-            scores = model.predict(x_test)
-            rauc[run_id], ap[run_id] = self.auc_performance(scores, y_test)
+            preds = model.predict(x_test)
+            for metric_name, value in self.get_metrics(y_test, preds).items():
+                metrics[metric_name][run_id] = value
 
-        # show training history
-        self.plot_loss(history)
+        with open(join(self.output_path, 'history.pkl'), 'wb') as f:
+            pickle.dump(history.history, f)
 
-        mean_auc = np.mean(rauc)
-        std_auc = np.std(rauc)
-        mean_aucpr = np.mean(ap)
-        std_aucpr = np.std(ap)
-        print(f'AUC:\nmean: {mean_auc}\nstd: {std_auc}\nAUC_PR\nmean: {mean_aucpr}\nstd: {std_aucpr}')
+        for metric_label, values in metrics.items():
+            print(f'For metric: {metric_label} -> avg: {values.mean()}, std: {values.std()}')
+
+        return history.history
 
 
 if __name__ == '__main__':
@@ -227,8 +222,6 @@ if __name__ == '__main__':
         'batch_size': 512,
         'epochs': 250,
         'num_runs': 5,
-        'known_outliers': 500,
-        'contamination_rate': 0.02,
         'seed': SEED
     }
     if dataset_path:
@@ -238,4 +231,5 @@ if __name__ == '__main__':
         dev_net_conf['output_path'] = output_path
 
     dev_net = DevNet(**dev_net_conf)
-    dev_net.run_devnet()
+    history = dev_net.run_devnet()
+    DevNet.plot_loss(history)
