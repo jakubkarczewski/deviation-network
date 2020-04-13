@@ -10,7 +10,8 @@ August4–8, 2019, Anchorage, AK, USA.ACM, New York, NY, USA, 10 pages. https://
 import pickle
 from os.path import join, isdir, isfile
 import argparse
-from copy import deepcopy
+from collections import defaultdict
+import json
 
 import tensorflow as tf
 import numpy as np
@@ -19,7 +20,7 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import average_precision_score, roc_auc_score, precision_recall_curve, auc
 from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
 from tensorflow.keras.optimizers import RMSprop
 from tensorflow.keras.layers import Input, Dense
 from tensorflow.keras.models import Model
@@ -43,7 +44,6 @@ class DevNet:
         self.epochs = epochs
         self.batch_size = batch_size
         self.num_runs = num_runs
-        self.num_batches = None
 
         self.limit_of_anomalies = limit_of_anomalies
         self.contamination_rate = contamination_rate
@@ -160,8 +160,6 @@ class DevNet:
         y = scaled_dataset['Class'].values
         x = scaled_dataset.drop(columns=['Class']).values
         print(f'X shape {x.shape}')
-        self.num_batches = len(x) // self.batch_size
-        print(f'Number of batches per epoch: {self.num_batches}')
         # inspect number of frauds (anomalies)
         anomalies = x[np.where(y == 1)[0]]
         print(f'There are {len(anomalies)} original frauds (outliers) in the dataset.')
@@ -191,25 +189,36 @@ class DevNet:
             # create model
             model = self.deviation_network(input_shape)
             model_name = f'devnet_cr:{self.contamination_rate}_bs:{self.batch_size}_ko:{self.limit_of_anomalies}.h5'
-            checkpointer = ModelCheckpoint(join(self.output_path, model_name), monitor='loss', verbose=0,
-                                           save_best_only=True)
+            callbacks = [
+                ModelCheckpoint(join(self.output_path, model_name), monitor='loss', verbose=0, save_best_only=True),
+                EarlyStopping(monitor='val_loss', min_delta=0, patience=25, verbose=0, mode='auto', baseline=None,
+                              restore_best_weights=True)
+            ]
+
             x_train, x_val, y_train, y_val = train_test_split(x_train, y_train, test_size=0.2, random_state=self.seed,
                                                               stratify=y_train)
             train_generator = self.get_data_generator(x_train, y_train)
             val_generator = self.get_data_generator(x_val, y_val)
+
             history = model.fit(train_generator, validation_data=val_generator,  epochs=self.epochs,
-                                steps_per_epoch=self.num_batches, validation_steps=len(x_val)//self.batch_size,
-                                callbacks=[checkpointer])
+                                steps_per_epoch=len(x_train)//self.batch_size,
+                                validation_steps=len(x_val)//self.batch_size, callbacks=callbacks)
 
             preds = model.predict(x_test)
             for metric_name, value in self.get_metrics(y_test, preds).items():
                 metrics[metric_name][run_id] = value
 
-        with open(join(self.output_path, 'history.pkl'), 'wb') as f:
-            pickle.dump(history.history, f)
+            with open(join(self.output_path, f'history_run:{run_id}.pkl'), 'wb') as f:
+                pickle.dump(history.history, f)
 
+        metrics_report = defaultdict(lambda: {'avg': None, 'std': None})
         for metric_label, values in metrics.items():
             print(f'For metric: {metric_label} -> avg: {values.mean()}, std: {values.std()}')
+            metrics_report[metric_label]['avg'] = values.mean()
+            metrics_report[metric_label]['std'] = values.std()
+
+        with open(join(self.output_path, 'metrics.json'), 'w') as f:
+            json.dump(dict(metrics_report), f)
 
         return history.history
 
@@ -228,7 +237,7 @@ if __name__ == '__main__':
 
     dev_net_conf = {
         'batch_size': 512,
-        'epochs': 250,
+        'epochs': 80,
         'num_runs': 5,
         'seed': SEED
     }
