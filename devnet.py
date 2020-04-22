@@ -126,11 +126,12 @@ class DevNet:
     def round_top_perc(preds, perc):
         return np.where(preds > np.percentile(preds, perc, interpolation='nearest'), 1, 0)
 
-    def get_metrics(self, gt, preds):
+    def get_metrics(self, gt, preds, convert_to_proba=True):
         """Returns performance metrics."""
         pred_3_perc = self.round_top_perc(np.abs(preds), 97)
         pred_1_perc = self.round_top_perc(np.abs(preds), 99)
-        preds = np.array([1 if abs(x) >= self.conf_threshold else 0 for x in preds])
+        if convert_to_proba:
+            preds = np.array([1 if abs(x) >= self.conf_threshold else 0 for x in preds])
         roc_auc = roc_auc_score(gt, preds)
         _, rec_1, _, _ = precision_recall_fscore_support(gt, pred_1_perc)
         _, rec_3, _, _ = precision_recall_fscore_support(gt, pred_3_perc)
@@ -167,8 +168,10 @@ class DevNet:
 
     def run_devnet(self):
         # create placeholder variables for scores in each run
-        metrics = {name: np.zeros(self.num_runs) for name in
-                   ('roc_auc', 'prec_rec_auc', 'recall_1%', 'recall_3%', 'avg_precision')}
+        all_metrics = dict()
+        for metrics_type in ('authors', 'mine'):
+            all_metrics[metrics_type] = {name: np.zeros(self.num_runs) for name in
+                                         ('roc_auc', 'prec_rec_auc', 'recall_1%', 'recall_3%', 'avg_precision')}
         # read data
         dataset = pd.read_csv(self.dataset_path)
         # scale data
@@ -223,17 +226,21 @@ class DevNet:
 
             preds = model.predict(x_test)
 
-            for metric_name, value in self.get_metrics(y_test, preds).items():
-                metrics[metric_name][run_id] = value
+            for metrics_type, fix in zip(all_metrics, (False, True)):
+                for metric_name, value in self.get_metrics(y_test, preds, convert_to_proba=fix).items():
+                    all_metrics[metrics_type][metric_name][run_id] = value
 
             with open(join(self.output_path, f'history_run:{run_id}.pkl'), 'wb') as f:
                 pickle.dump(history.history, f)
 
-        metrics_report = defaultdict(lambda: {'avg': None, 'std': None})
-        for metric_label, values in metrics.items():
-            print(f'For metric: {metric_label} -> avg: {values.mean()}, std: {values.std()}')
-            metrics_report[metric_label]['avg'] = values.mean()
-            metrics_report[metric_label]['std'] = values.std()
+        metrics_report = dict()
+        for metrics_type in all_metrics:
+            partial_metrics_report = defaultdict(lambda: {'avg': None, 'std': None})
+            for metric_label, values in all_metrics[metrics_type].items():
+                print(f'For {metrics_type} metric: {metric_label} -> avg: {values.mean()}, std: {values.std()}')
+                partial_metrics_report[metric_label]['avg'] = values.mean()
+                partial_metrics_report[metric_label]['std'] = values.std()
+            metrics_report[metrics_type] = partial_metrics_report
 
         with open(join(self.output_path, 'metrics.json'), 'w') as f:
             json.dump(dict(metrics_report), f)
@@ -251,8 +258,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_path", type=str, default='dataset/', help="Path to the csv with creditcard dataset")
     parser.add_argument("--output_path", type=str, default='output/', help="Path to the output directory.")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs in trainings.")
-    parser.add_argument("--num_runs", type=int, default=1, help="Number of training to run.")
+    parser.add_argument("--epochs", type=int, default=150, help="Number of epochs in trainings.")
+    parser.add_argument("--num_runs", type=int, default=10, help="Number of training to run.")
     args = parser.parse_args()
 
     dataset_path = args.dataset_path if isfile(args.dataset_path) else None
