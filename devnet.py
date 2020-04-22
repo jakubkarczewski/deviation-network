@@ -251,6 +251,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_path", type=str, default='dataset/', help="Path to the csv with creditcard dataset")
     parser.add_argument("--output_path", type=str, default='output/', help="Path to the output directory.")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs in trainins.")
     args = parser.parse_args()
 
     dataset_path = args.dataset_path if isfile(args.dataset_path) else None
@@ -261,9 +262,9 @@ if __name__ == '__main__':
 
     dev_net_conf = {
         'batch_size': 512,
-        'epochs': 80,
         'num_runs': 5,
-        'seed': SEED
+        'seed': SEED,
+        'epochs': args.epochs
     }
     if dataset_path:
         dev_net_conf['dataset_path'] = dataset_path
