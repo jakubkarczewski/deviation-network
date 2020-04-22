@@ -18,7 +18,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import average_precision_score, roc_auc_score, precision_recall_curve, auc
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, precision_recall_curve, auc, \
+    average_precision_score
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
 from tensorflow.keras.optimizers import RMSprop
@@ -52,6 +53,8 @@ class DevNet:
 
         self.scaler = MinMaxScaler()
         self.random_state = np.random.RandomState(self.seed)
+        # 95% confidence threshold score value
+        self.conf_threshold = 1.96
 
     @staticmethod
     @tf.function
@@ -120,18 +123,31 @@ class DevNet:
         return x_train, y_train
 
     @staticmethod
-    def get_metrics(gt, preds):
+    def round_top_perc(preds, perc):
+        return np.where(preds > np.percentile(preds, perc, interpolation='nearest'), 1, 0)
+
+    def get_metrics(self, gt, preds):
         """Returns performance metrics."""
+        pred_3_perc = self.round_top_perc(np.abs(preds), 97)
+        pred_1_perc = self.round_top_perc(np.abs(preds), 99)
+        preds = np.array([1 if abs(x) >= self.conf_threshold else 0 for x in preds])
         roc_auc = roc_auc_score(gt, preds)
+        _, rec_1, _, _ = precision_recall_fscore_support(gt, pred_1_perc)
+        _, rec_3, _, _ = precision_recall_fscore_support(gt, pred_3_perc)
         precision, recall, _ = precision_recall_curve(gt, preds)
-        pr_auc = auc(recall, precision)
+        prec_rec_auc = auc(recall, precision)
         avg_precision = average_precision_score(gt, preds)
-        print(f"AUC-ROC: {roc_auc}, AUC-PR: {pr_auc}, Avg precision: {avg_precision}")
-        return {'AUC-ROC': roc_auc, 'AUC-PR': pr_auc, 'Avg Precision': avg_precision}
+        return {
+            'roc_auc': np.around(roc_auc, decimals=4),
+            'prec_rec_auc': np.around(prec_rec_auc, decimals=4),
+            'recall_1%': np.around(rec_1[-1], decimals=5),
+            'recall_3%': np.around(rec_3[-1], decimals=5),
+            'avg_precision': np.around(avg_precision, decimals=5)
+        }
 
     @staticmethod
     def plot_loss(history):
-        # Plot training & validation loss values
+        """Plot training & validation loss values."""
         plt.plot(history['loss'])
         plt.plot(history['val_loss'])
         plt.title('Model loss')
@@ -151,7 +167,8 @@ class DevNet:
 
     def run_devnet(self):
         # create placeholder variables for scores in each run
-        metrics = {name: np.zeros(self.num_runs) for name in ('AUC-ROC', 'AUC-PR', 'Avg Precision')}
+        metrics = {name: np.zeros(self.num_runs) for name in
+                   ('roc_auc', 'prec_rec_auc', 'recall_1%', 'recall_3%', 'avg_precision')}
         # read data
         dataset = pd.read_csv(self.dataset_path)
         # scale data
@@ -188,7 +205,7 @@ class DevNet:
 
             # create model
             model = self.deviation_network(input_shape)
-            model_name = f'devnet_cr:{self.contamination_rate}_bs:{self.batch_size}_ko:{self.limit_of_anomalies}.h5'
+            model_name = f'devnet_run_{run_id}.h5'
             callbacks = [
                 ModelCheckpoint(join(self.output_path, model_name), monitor='loss', verbose=0, save_best_only=True),
                 EarlyStopping(monitor='val_loss', min_delta=0, patience=25, verbose=0, mode='auto', baseline=None,
@@ -202,9 +219,10 @@ class DevNet:
 
             history = model.fit(train_generator, validation_data=val_generator,  epochs=self.epochs,
                                 steps_per_epoch=len(x_train)//self.batch_size,
-                                validation_steps=len(x_val)//self.batch_size, callbacks=callbacks)
+                                validation_steps=len(x_val)//self.batch_size, callbacks=callbacks, verbose=0)
 
             preds = model.predict(x_test)
+
             for metric_name, value in self.get_metrics(y_test, preds).items():
                 metrics[metric_name][run_id] = value
 
@@ -220,7 +238,13 @@ class DevNet:
         with open(join(self.output_path, 'metrics.json'), 'w') as f:
             json.dump(dict(metrics_report), f)
 
-        return history.history
+        return {
+            'model': model,
+            'predictions': preds,
+            'ground_truth': y_test,
+            'history': history.history,
+            'metrics': metrics_report
+        }
 
 
 if __name__ == '__main__':
@@ -248,5 +272,5 @@ if __name__ == '__main__':
         dev_net_conf['output_path'] = output_path
 
     dev_net = DevNet(**dev_net_conf)
-    history = dev_net.run_devnet()
-    DevNet.plot_loss(history)
+    results = dev_net.run_devnet()
+    DevNet.plot_loss(results['history'])
